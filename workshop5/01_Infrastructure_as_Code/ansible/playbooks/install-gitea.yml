@@ -1,0 +1,435 @@
+- name: Install and configure Gitea with admin user (no GUI)
+  hosts: gitea
+  become: true
+  # gather_facts: yes
+
+  vars:
+    gitea_version: "1.24.6"
+    gitea_user: "git"
+    gitea_group: "git"
+    gitea_root: "/var/lib/gitea"
+    gitea_bin: "/usr/local/bin/gitea"
+
+    # Admin user
+    gitea_admin_user: "student"
+    gitea_admin_email: "student@example.com"
+    gitea_admin_password: "{{ password }}"   # from vault.yml (Ansible vault)
+
+  tasks:
+    - name: Ensure dependencies
+      ansible.builtin.apt:
+        name: [ca-certificates, wget, git]
+        state: present
+        update_cache: yes
+
+    - name: Ensure gitea group exists
+      ansible.builtin.group:
+        name: "{{ gitea_group }}"
+        system: true
+
+    - name: Create gitea user
+      ansible.builtin.user:
+        name: "{{ gitea_user }}"
+        group: "{{ gitea_group }}"
+        shell: /bin/bash
+        system: true
+        home: "{{ gitea_root }}"
+        create_home: false
+
+    - name: Create required directories
+      ansible.builtin.file:
+        path: "{{ item.path }}"
+        state: directory
+        owner: "{{ item.owner | default(gitea_user) }}"
+        group: "{{ item.group | default(gitea_group) }}"
+        mode: "{{ item.mode | default('0755') }}"
+      loop:
+        - { path: "{{ gitea_root }}" }
+        - { path: "{{ gitea_root }}/custom" }
+        - { path: "{{ gitea_root }}/custom/conf" }
+        - { path: "{{ gitea_root }}/data" }
+        - { path: "{{ gitea_root }}/indexers" }
+        - { path: "{{ gitea_root }}/log" }
+
+    - name: Download Gitea binary
+      ansible.builtin.get_url:
+        url: "https://dl.gitea.com/gitea/{{ gitea_version }}/gitea-{{ gitea_version }}-linux-amd64"
+        dest: "{{ gitea_bin }}"
+        mode: "0755"
+
+    # --------- Generate secrets (so Gitea won't try to edit config) ---------
+    - name: Generate SECRET_KEY
+      become_user: "{{ gitea_user }}"
+      environment: { HOME: "{{ gitea_root }}" }
+      ansible.builtin.command: "{{ gitea_bin }} generate secret SECRET_KEY"
+      register: secret_key
+
+    - name: Generate INTERNAL_TOKEN
+      become_user: "{{ gitea_user }}"
+      environment: { HOME: "{{ gitea_root }}" }
+      ansible.builtin.command: "{{ gitea_bin }} generate secret INTERNAL_TOKEN"
+      register: internal_token
+
+    - name: Generate LFS_JWT_SECRET
+      become_user: "{{ gitea_user }}"
+      environment: { HOME: "{{ gitea_root }}" }
+      ansible.builtin.command: "{{ gitea_bin }} generate secret LFS_JWT_SECRET"
+      register: lfs_jwt_secret
+
+    - name: Generate OAuth2 JWT_SECRET
+      become_user: "{{ gitea_user }}"
+      environment: { HOME: "{{ gitea_root }}" }
+      ansible.builtin.command: "{{ gitea_bin }} generate secret JWT_SECRET"
+      register: oauth2_jwt_secret
+
+    # --------- Single config owned by git under custom/conf ---------
+    - name: Write custom app.ini
+      ansible.builtin.copy:
+        dest: "{{ gitea_root }}/custom/conf/app.ini"
+        owner: "{{ gitea_user }}"
+        group: "{{ gitea_group }}"
+        mode: "0640"
+        content: |
+          RUN_USER = {{ gitea_user }}
+
+          [server]
+          PROTOCOL   = http
+          HTTP_ADDR  = 0.0.0.0
+          HTTP_PORT  = 3000
+          ROOT_URL   = http://{{ ansible_facts['default_ipv4']['address'] }}:3000/
+          LFS_START_SERVER = true
+          LFS_JWT_SECRET = {{ lfs_jwt_secret.stdout }}
+
+          [actions]
+          ENABLED = true
+
+          [database]
+          DB_TYPE = sqlite3
+          PATH    = {{ gitea_root }}/data/gitea.db
+
+          [log]
+          MODE      = file
+          LEVEL     = Info
+          ROOT_PATH = {{ gitea_root }}/log
+
+          [security]
+          INSTALL_LOCK   = true
+          SECRET_KEY     = {{ secret_key.stdout }}
+          INTERNAL_TOKEN = {{ internal_token.stdout }}
+
+          [oauth2]
+          JWT_SECRET = {{ oauth2_jwt_secret.stdout }}
+
+    - name: Remove legacy /etc/gitea/app.ini if present (avoid confusion)
+      file:
+        path: /etc/gitea/app.ini
+        state: absent
+
+    # --------- Systemd service points to that same config ---------
+    - name: Install/refresh systemd unit
+      copy:
+        dest: /etc/systemd/system/gitea.service
+        mode: "0644"
+        content: |
+          [Unit]
+          Description=Gitea (Git with a cup of tea)
+          Wants=network-online.target
+          After=network-online.target
+
+          [Service]
+          Type=simple
+          User={{ gitea_user }}
+          Group={{ gitea_group }}
+          WorkingDirectory={{ gitea_root }}
+          Environment=HOME={{ gitea_root }}
+          Environment=GITEA_WORK_DIR={{ gitea_root }}
+          Environment=GITEA_CUSTOM={{ gitea_root }}/custom
+          ExecStart={{ gitea_bin }} web --config {{ gitea_root }}/custom/conf/app.ini
+          Restart=always
+          RestartSec=2s
+          LimitNOFILE=65535
+
+          [Install]
+          WantedBy=multi-user.target
+      notify: Daemon reload
+
+    # --------- Initialize DB schema, then start service ---------
+    - name: Run DB migrations
+      become_user: "{{ gitea_user }}"
+      environment:
+        HOME: "{{ gitea_root }}"
+        GITEA_WORK_DIR: "{{ gitea_root }}"
+        GITEA_CUSTOM: "{{ gitea_root }}/custom"
+      command: "{{ gitea_bin }} --config {{ gitea_root }}/custom/conf/app.ini migrate"
+
+    - name: Enable and start Gitea
+      systemd:
+        name: gitea
+        enabled: true
+        state: started
+        daemon_reload: true
+      notify: Restart gitea # also restart gitea service in case secrets have changed
+
+    # --------- Create admin user without GUI ---------
+    - name: Wait until Gitea HTTP is up
+      wait_for:
+        host: 127.0.0.1
+        port: 3000
+        timeout: 60
+
+    - name: List existing users (idempotency check)
+      become_user: "{{ gitea_user }}"
+      environment:
+        HOME: "{{ gitea_root }}"
+      command: "{{ gitea_bin }} admin user list --config {{ gitea_root }}/custom/conf/app.ini"
+      register: gitea_user_list
+      changed_when: false
+      failed_when: false
+
+    - name: Create admin user if missing
+      become_user: "{{ gitea_user }}"
+      environment:
+        HOME: "{{ gitea_root }}"
+      no_log: true
+      command: >
+        {{ gitea_bin }} admin user create
+        --config {{ gitea_root }}/custom/conf/app.ini
+        --username {{ gitea_admin_user }}
+        --password {{ gitea_admin_password }}
+        --email {{ gitea_admin_email }}
+        --admin
+        --must-change-password=false
+      when: gitea_user_list.stdout is not search('(^|\\s)'+ gitea_admin_user +'(\\s|$)')
+
+  handlers:
+    - name: Daemon reload
+      systemd:
+        daemon_reload: true
+
+    - name: Restart gitea
+      systemd:
+        name: gitea
+        state: restarted
+
+#####################################################################
+# Create admin PAT via API and store in Ansible vault
+#####################################################################
+- name: Create Gitea Admin Token (API) and Store in Ansible Vault
+  hosts: servers
+  become: true
+  vars:
+    gitea_url: 'http://192.168.122.99:3000'         # change to https origin if you use a TLS proxy
+    admin_user: 'student'                           # MUST be a site admin in Gitea
+    # admin_pass: '{{ vault_gitea_admin_password }}'  # store in Ansible Vault
+    admin_pass: 'Pa55w0rd!'  # store in Ansible Vault
+    token_name: 'admin'
+    ansible_remote_tmp: /tmp/.ansible
+    vault_file: "{{ playbook_dir }}/../group_vars/all/vault.yml"
+    vault_identity: "~/.ansible/.vault-pass.txt"
+  pre_tasks:
+    - name: Ensure shared Ansible temp dir exists
+      file:
+        path: /tmp/.ansible
+        state: directory
+        mode: '1777'
+
+  tasks:
+    # List existing tokens
+    - name: List existing tokens for admin_user
+      uri:
+        url: '{{ gitea_url }}/api/v1/users/{{ admin_user }}/tokens'
+        method: GET
+        user: '{{ admin_user }}'
+        password: '{{ admin_pass }}'
+        force_basic_auth: true
+        status_code: 200
+        return_content: yes
+      register: pat_list
+      no_log: true
+
+    # Delete any that match token_name (idempotent)
+    - name: Delete tokens named {{ token_name }}
+      uri:
+        url: '{{ gitea_url }}/api/v1/users/{{ admin_user }}/tokens/{{ item.id }}'
+        method: DELETE
+        user: '{{ admin_user }}'
+        password: '{{ admin_pass }}'
+        force_basic_auth: true
+        status_code: 204
+      loop: "{{ pat_list.json | selectattr('name','equalto', token_name) | list }}"
+      loop_control:
+        label: "{{ item.name }} (id={{ item.id }})"
+      when: (pat_list.json | selectattr('name','equalto', token_name) | list | length) > 0
+      no_log: true
+
+    # Create PAT (scoped). Some versions return 400/422 for unknown/unsupported scopes; if so, retry unscoped.
+    - name: Create PAT with scopes (preferred)
+      uri:
+        url: '{{ gitea_url }}/api/v1/users/{{ admin_user }}/tokens'
+        method: POST
+        user: '{{ admin_user }}'
+        password: '{{ admin_pass }}'
+        force_basic_auth: true
+        body_format: json
+        body:
+          name: '{{ token_name }}'
+          scopes: ['all']
+        # Accept 201 (created). 400/422 means this server likely doesn't support scopes payload.
+        status_code: [201, 400, 422]
+        return_content: yes
+      register: pat_create_scoped
+      no_log: true
+
+    - name: Create PAT without scopes (compat fallback)
+      uri:
+        url: '{{ gitea_url }}/api/v1/users/{{ admin_user }}/tokens'
+        method: POST
+        user: '{{ admin_user }}'
+        password: '{{ admin_pass }}'
+        force_basic_auth: true
+        body_format: json
+        body:
+          name: '{{ token_name }}'
+        status_code: 201
+        return_content: yes
+      register: pat_create_unscoped
+      when: pat_create_scoped.status != 201
+      no_log: true
+
+    - name: Choose final PAT value
+      set_fact:
+        gitea_admin_token: >-
+          {{
+            (pat_create_scoped.json.sha1 | default(''))
+            or (pat_create_unscoped.json.sha1 | default(''))
+          }}
+      no_log: true
+
+    - name: Assert PAT exists
+      assert:
+        that: "(gitea_admin_token | default('')) | length > 10"
+        fail_msg: 'Failed to create a PAT via API.'
+      no_log: true
+
+    - name: Verify PAT works (whoami)
+      uri:
+        url: '{{ gitea_url }}/api/v1/user'
+        headers:
+          Authorization: 'token {{ gitea_admin_token }}'
+        status_code: 200
+        return_content: yes
+      register: whoami
+      no_log: true
+
+    # --- Store PAT in a fully-encrypted vault file (editable via `ansible-vault edit`) ---
+    - name: Define local vault paths
+      delegate_to: localhost
+      become: false
+      vars:
+        # Use an absolute path on the controller
+        _vault_file: "{{ (vault_file is defined) | ternary(vault_file, playbook_dir ~ '/group_vars/all/vault.yml') }}"
+        # If you already set vault_file elsewhere, prefer: "{{ playbook_dir }}/../group_vars/all/vault.yml"
+      block:
+        - name: Ensure vault dir exists
+          file:
+            path: "{{ _vault_file | dirname }}"
+            state: directory
+            mode: "0755"
+
+        - name: Create a controller-local temp file
+          tempfile:
+            state: file
+            suffix: ".yml"
+          register: _tmpfile
+
+        - name: Remember temp path
+          set_fact:
+            _tmp_plain: "{{ _tmpfile.path }}"
+
+        - name: Check if vault file exists
+          stat:
+            path: "{{ _vault_file }}"
+          register: _vf
+
+        - name: Detect if vault file is already fully encrypted
+          shell: "head -n1 {{ _vault_file | quote }} | grep -q '^\\$ANSIBLE_VAULT;'"
+          register: _is_enc
+          changed_when: false
+          failed_when: false
+          when: _vf.stat.exists
+
+        # 1) Decrypt existing encrypted file -> plain temp
+        - name: Decrypt current vault.yml to temp (if encrypted)
+          shell: >
+            ansible-vault decrypt
+            --vault-password-file {{ vault_identity }}
+            --output {{ _tmp_plain | quote }}
+            {{ _vault_file | quote }}
+          when: _vf.stat.exists and _is_enc.rc == 0
+          changed_when: true
+
+        # 2) If exists but NOT encrypted, copy it to temp as starting point
+        - name: Copy existing plaintext to temp (if not encrypted)
+          copy:
+            src: "{{ _vault_file }}"
+            dest: "{{ _tmp_plain }}"
+            mode: "0600"
+          when: _vf.stat.exists and _is_enc.rc != 0
+
+        # 3) If no file at all, start a new empty YAML
+        - name: Initialize new temp YAML if vault file missing
+          copy:
+            dest: "{{ _tmp_plain }}"
+            content: "---\n"
+            mode: "0600"
+          when: not _vf.stat.exists
+
+        # READ -> MERGE -> WRITE
+        # Read existing temp YAML (may be empty)
+        - name: Slurp temp YAML
+          slurp:
+            path: "{{ _tmp_plain }}"
+          register: _slurped
+
+        # Parse and normalize to a dict ({} if not mapping)
+        - name: Parse temp YAML (normalize to dict)
+          set_fact:
+            _plain_map: >-
+              {{
+                (
+                  (_slurped.content | b64decode | from_yaml)
+                  | default({}, true)
+                )
+                if ((_slurped is defined) and (_slurped.content is defined))
+                else {}
+              }}
+        - name: Ensure _plain_map is a dict
+          set_fact:
+            _plain_map: "{{ {} if (_plain_map is not mapping) else _plain_map }}"
+
+        # Merge the token and write back
+        - name: Merge gitea_admin_token and write temp YAML
+          copy:
+            dest: "{{ _tmp_plain }}"
+            mode: "0600"
+            content: >-
+              {{
+                _plain_map
+                | combine({'gitea_admin_token': gitea_admin_token}, recursive=True)
+                | to_nice_yaml(indent=2)
+              }}
+
+        # Re-encrypt the entire file
+        - name: Encrypt temp YAML back to {{ _vault_file }}
+          shell: >
+            ansible-vault encrypt
+            --vault-password-file {{ vault_identity }}
+            --output {{ _vault_file | quote }}
+            {{ _tmp_plain | quote }}
+          changed_when: true
+
+      always:
+        - name: Remove temp file
+          file:
+            path: "{{ _tmp_plain | default(_tmpfile.path, true) }}"
+            state: absent

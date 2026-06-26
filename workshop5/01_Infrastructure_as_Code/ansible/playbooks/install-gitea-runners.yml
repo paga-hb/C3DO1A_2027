@@ -1,0 +1,116 @@
+---
+#####################################################################
+# Fetch runner registration token
+#####################################################################
+- name: Create Gitea Admin Token (API) & Fetch Runner Registration Token
+  hosts: gitea
+  become: true
+  vars_files:
+      - group_vars/all/vault.yml
+      - group_vars/all/vars.yml
+  vars:
+      gitea_url: "{{ gitea_site_url }}" # from vars.yml (change to https when using a TLS proxy)
+      admin_user: 'student'             # MUST be a site admin in Gitea
+      admin_pass: "{{ password }}"      # from vault.yml (Ansible vault)
+      token_name: 'admin'
+      ansible_remote_tmp: /tmp/.ansible
+  pre_tasks:
+    - name: Ensure shared Ansible temp dir exists
+      ansible.builtin.file:
+        path: /tmp/.ansible
+        state: directory
+        mode: '1777'
+
+  tasks:
+    - name: Fetch global runner registration token (admin-only)
+      ansible.builtin.uri:
+        url: '{{ gitea_url }}/api/v1/admin/runners/registration-token'
+        headers:
+          Authorization: 'token {{ gitea_admin_token }}' # from vault.yml (Ansible vault)
+        method: GET
+        status_code: 200
+        return_content: yes
+      register: regtok
+      no_log: true
+
+    - name: Save runner registration token for runner play
+      ansible.builtin.set_fact:
+        runner_reg_token: '{{ regtok.json.token }}'
+      delegate_facts: true
+      no_log: true
+
+#####################################################################
+# Register/start multiple act_runners per runner host
+#####################################################################
+- name: Register and Start Gitea Runners
+  hosts: gitea
+  become: true
+  vars:
+    gitea_url: 'http://192.168.122.99:3000'   # keep consistent with Play 1
+    runner_image: 'gitea/act_runner:0.2.13'
+    # runner_labels: 'ubuntu-latest:docker://mcr.microsoft.com/dotnet/sdk:8.0'
+    runner_labels: 'ubuntu-latest:docker://docker.gitea.com/runner-images:ubuntu-latest'
+    runner_token: "{{ hostvars[groups['gitea'][0]].runner_reg_token }}"
+
+    # How many runners per host:
+    num_runners: 1
+    # ['01','02',...]
+    runner_ids: "{{ query('sequence','start=1 end=' ~ num_runners ~ ' format=%02d') }}"
+    # hostname prefix (short name)
+    runner_prefix: "{{ inventory_hostname_short | default(inventory_hostname | regex_replace('\\..*','')) }}"
+  tasks:
+    - name: Create runner base dirs
+      ansible.builtin.file:
+        path: "/opt/act-runner/{{ runner_prefix }}-runner-{{ item }}/data"
+        state: directory
+        mode: '0755'
+        recurse: true
+      loop: "{{ runner_ids }}"
+      loop_control:
+        label: "{{ runner_prefix }}-runner-{{ item }}"
+
+    - name: Download act_runner binary if needed (per runner dir)
+      args:
+        chdir: "/opt/act-runner/{{ runner_prefix }}-runner-{{ item }}"
+      ansible.builtin.shell: |
+        set -e
+        if [ ! -x ./act_runner ]; then
+          curl -fsSL -o act_runner \
+            'https://dl.gitea.com/act_runner/0.2.13/act_runner-0.2.13-linux-amd64'
+          chmod +x act_runner
+          ./act_runner --version
+        fi
+      loop: "{{ runner_ids }}"
+      loop_control:
+        label: "{{ runner_prefix }}-runner-{{ item }}"
+
+    - name: Register each runner (non-interactive)
+      args:
+        chdir: "/opt/act-runner/{{ runner_prefix }}-runner-{{ item }}"
+      ansible.builtin.shell: |
+        set -e
+        ./act_runner register --no-interactive \
+          --instance '{{ gitea_url }}' \
+          --token '{{ runner_token }}' \
+          --name '{{ runner_prefix }}-runner-{{ item }}' \
+          --labels '{{ runner_labels }}'
+        mv -f .runner "/opt/act-runner/{{ runner_prefix }}-runner-{{ item }}/data/.runner"
+      loop: "{{ runner_ids }}"
+      loop_control:
+        label: "{{ runner_prefix }}-runner-{{ item }}"
+
+    - name: Start runner containers (Docker executor)
+      community.docker.docker_container:
+        name: "{{ runner_prefix }}-runner-{{ item }}"
+        image: "{{ runner_image }}"
+        restart_policy: unless-stopped
+        env:
+          GITEA_RUNNER_NAME: "{{ runner_prefix }}-runner-{{ item }}"
+          GITEA_INSTANCE_URL: "{{ gitea_url }}"
+        volumes:
+          - /var/run/docker.sock:/var/run/docker.sock
+          - "/opt/act-runner/{{ runner_prefix }}-runner-{{ item }}/data:/data"
+      loop: "{{ runner_ids }}"
+      loop_control:
+        label: "{{ runner_prefix }}-runner-{{ item }}"
+

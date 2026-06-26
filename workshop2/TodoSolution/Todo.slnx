@@ -1,0 +1,9 @@
+<Solution>
+  <Project Path="Todo.Api.IntegrationTests/Todo.Api.IntegrationTests.csproj" />
+  <Project Path="Todo.Api.UnitTests/Todo.Api.UnitTests.csproj" />
+  <Project Path="Todo.Api/Todo.Api.csproj" />
+  <Project Path="Todo.Blazor.EndToEndTests/Todo.Blazor.EndToEndTests.csproj" />
+  <Project Path="Todo.Blazor/Todo.Blazor.csproj" />
+  <Project Path="Todo.Data/Todo.Data.csproj" />
+  <Project Path="Todo.Dto/Todo.Dto.csproj" />
+</Solution>

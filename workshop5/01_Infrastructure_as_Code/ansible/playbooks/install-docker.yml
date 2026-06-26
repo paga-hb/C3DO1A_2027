@@ -1,0 +1,159 @@
+- name: Install Docker Engine on Ubuntu / Ubuntu-like distros
+  hosts: gitea
+  become: true
+
+  vars:
+    # Add any local users you want to run docker without sudo
+    docker_users:
+      - student
+      - ansible
+    
+    docker_insecure_registries:
+      - "{{ gitea_site_ip }}"   # from vars.yml
+
+  pre_tasks:
+    - name: Map architecture and Ubuntu codename
+      ansible.builtin.set_fact:
+        docker_arch: >-
+          {{ {
+              'x86_64':'amd64',
+              'aarch64':'arm64',
+              'armv7l':'armhf',
+              'armv6l':'armhf'
+            }[ansible_facts['architecture']] | default('amd64') }}
+        ubuntu_codename: "{{ ansible_facts['lsb']['codename'] | default(ansible_facts['distribution_release']) }}"
+
+  handlers:
+    - name: Restart docker
+      ansible.builtin.service:
+        name: docker
+        state: restarted
+  
+  tasks:
+    - name: Remove legacy Docker packages (safe if absent)
+      ansible.builtin.apt:
+        name:
+          - docker
+          - docker-engine
+          - docker.io
+          - containerd
+          - runc
+        state: absent
+        purge: true
+        autoremove: true
+        update_cache: false
+
+    - name: Install prerequisite packages
+      ansible.builtin.apt:
+        name:
+          - ca-certificates
+          - curl
+          - gnupg
+          - lsb-release
+        state: present
+        update_cache: true
+
+    - name: Ensure /etc/apt/keyrings exists
+      ansible.builtin.file:
+        path: /etc/apt/keyrings
+        state: directory
+        mode: "0755"
+
+    # --- GPG key (no pipefail; pure Ansible) ---
+    - name: Download Docker GPG key (ASCII)
+      ansible.builtin.get_url:
+        url: https://download.docker.com/linux/ubuntu/gpg
+        dest: /etc/apt/keyrings/docker.asc
+        mode: "0644"
+
+    - name: Convert ASCII key to keyring
+      ansible.builtin.command:
+        argv:
+          - gpg
+          - --dearmor
+          - --output
+          - /etc/apt/keyrings/docker.gpg
+          - /etc/apt/keyrings/docker.asc
+      args:
+        creates: /etc/apt/keyrings/docker.gpg
+
+    - name: Ensure keyring is world-readable
+      ansible.builtin.file:
+        path: /etc/apt/keyrings/docker.gpg
+        mode: "0644"
+
+    - name: Add Docker APT repository
+      ansible.builtin.copy:
+        dest: /etc/apt/sources.list.d/docker.list
+        mode: "0644"
+        content: |
+          deb [arch={{ docker_arch }} signed-by=/etc/apt/keyrings/docker.gpg] https://download.docker.com/linux/ubuntu {{ ubuntu_codename }} stable
+
+    - name: Update apt cache
+      ansible.builtin.apt:
+        update_cache: true
+
+    - name: Install Docker Engine components
+      ansible.builtin.apt:
+        name:
+          - docker-ce
+          - docker-ce-cli
+          - containerd.io
+          - docker-buildx-plugin
+          - docker-compose-plugin
+        state: present
+
+    - name: Ensure 'docker' group exists (be explicit)
+      ansible.builtin.group:
+        name: docker
+        state: present
+
+    - name: Ensure Docker is enabled and running
+      ansible.builtin.systemd:
+        name: docker
+        enabled: true
+        state: started
+
+    - name: Add users to the docker group
+      ansible.builtin.user:
+        name: "{{ item }}"
+        groups: docker
+        append: true
+      loop: "{{ docker_users }}"
+      when: docker_users | length > 0
+
+    - name: Ensure /etc/docker exists
+      ansible.builtin.file:
+        path: /etc/docker
+        state: directory
+        mode: '0755'
+
+    - name: Configure Docker insecure registries
+      ansible.builtin.copy:
+        dest: /etc/docker/daemon.json
+        mode: '0644'
+        content: |
+          {
+            "insecure-registries": {{ docker_insecure_registries | to_json }}
+          }
+      notify: Restart docker
+
+    - name: Flush handlers so Docker is restarted before runners start
+      ansible.builtin.meta: flush_handlers
+
+    # Make subsequent tasks in this play see the updated group membership
+    - name: Reset SSH connection to pick up new groups
+      ansible.builtin.meta: reset_connection
+
+    # --- Optional verification (safe to keep or remove) ---
+    - name: Show docker group members and socket owner
+      ansible.builtin.shell: |
+        set -eu
+        echo "docker group: $(getent group docker || true)"
+        stat -c 'docker.sock group=%G perms=%a' /var/run/docker.sock || true
+      register: docker_info
+      changed_when: false
+
+    - name: Print info
+      ansible.builtin.debug:
+        msg: "{{ docker_info.stdout_lines }}"

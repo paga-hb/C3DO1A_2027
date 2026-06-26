@@ -1,0 +1,134 @@
+---
+- name: Install and configure Nginx
+  hosts: gitea
+  become: true
+  vars:
+    server_name: "example.local"     # Hostname or domain
+    enable_ufw: false                # Set false if not using UFW
+    remove_default_site: false       # Remove default website
+    ssl_dir: "/etc/nginx/ssl"
+    ssl_key_path: "{{ ssl_dir }}/private.key"
+    ssl_cert_path: "{{ ssl_dir }}/public.pem"
+    ssl_days: 365
+    ssl_subject:
+      common_name: "{{ server_name }}"
+      country_name: "SE"
+      organization_name: "Example Co"
+    pfx_path: "{{ ssl_dir }}/site.pfx"
+    pfx_password: "{{ password }}"   # From group_vars/all/vault.yml
+
+  pre_tasks:
+    - name: Ensure apt cache is up to date
+      apt:
+        update_cache: yes
+        cache_valid_time: 3600
+
+  tasks:
+    - name: Install Nginx
+      apt:
+        name: nginx
+        state: present
+
+    - name: Ensure Nginx service is enabled and running
+      systemd:
+        name: nginx
+        enabled: yes
+        state: started
+
+    # --- Optional firewall (UFW) ---
+    - name: Check if UFW is installed
+      stat:
+        path: /usr/sbin/ufw
+      register: ufw_bin
+
+    - name: Allow HTTP/HTTPS via UFW
+      command: ufw allow "{{ item }}"
+      loop:
+        - "80/tcp"
+        - "443/tcp"
+      when: enable_ufw and ufw_bin.stat.exists
+      changed_when: "'Rule added' in ufw_result.stdout"
+      register: ufw_result
+      ignore_errors: true
+
+    # --- Optional default site ---
+    - name: Remove default site (optional)
+      file:
+        path: /etc/nginx/sites-enabled/default
+        state: absent
+      when: remove_default_site
+      notify: Reload Nginx
+
+    # --- Self-signed TLS cert (idempotent) ---
+    - name: Ensure SSL directory exists
+      file:
+        path: "{{ ssl_dir }}"
+        state: directory
+        owner: root
+        group: root
+        mode: "0755"
+
+    - name: Generate RSA private key (2048-bit)
+      community.crypto.openssl_privatekey:
+        path: "{{ ssl_key_path }}"
+        type: RSA
+        size: 2048
+        mode: "0600"
+
+    # Create a CSR with CN and SANs
+    - name: Create CSR for {{ server_name }}
+      community.crypto.openssl_csr:
+        path: "{{ ssl_dir }}/server.csr"
+        privatekey_path: "{{ ssl_key_path }}"
+        common_name: "{{ server_name }}"
+        subject_alt_name:
+          - "DNS:{{ server_name }}"
+          # - "DNS:www.{{ server_name }}"  # add more if needed
+        mode: "0644"
+
+    # Issue a self-signed cert from the CSR
+    - name: Create a self-signed certificate ({{ ssl_days | default(365) }} days)
+      community.crypto.x509_certificate:
+        path: "{{ ssl_cert_path }}"
+        csr_path: "{{ ssl_dir }}/server.csr"
+        privatekey_path: "{{ ssl_key_path }}"
+        provider: selfsigned
+        selfsigned_not_after: "+{{ ssl_days | default(365) }}d"
+        mode: "0644"
+      notify: Reload Nginx
+
+    # Build a PKCS#12 (PFX) for Kestrel from the PEM cert + key (idempotent)
+    - name: Create PKCS#12 (PFX) for Kestrel
+      community.crypto.openssl_pkcs12:
+        action: export
+        path: "{{ pfx_path }}"
+        privatekey_path: "{{ ssl_key_path }}"
+        certificate_path: "{{ ssl_cert_path }}"
+        passphrase: "{{ pfx_password }}"
+        friendly_name: "{{ server_name }}"
+        state: present
+        owner: www-data
+        group: www-data
+        mode: "0640"
+
+    # (Optional) Ensure ownership/permissions explicitly if you don’t set them above
+    # - name: Set ownership/permissions on PFX
+    #   file:
+    #     path: "{{ pfx_path }}"
+    #     owner: www-data
+    #     group: www-data
+    #     mode: "0640"
+
+    # --- Text Nginx config ---
+    - name: Test Nginx config
+      command: nginx -t
+      register: nginx_test
+      changed_when: false
+      failed_when: nginx_test.rc != 0
+
+  handlers:
+    - name: Reload Nginx
+      systemd:
+        name: nginx
+        state: reloaded
+

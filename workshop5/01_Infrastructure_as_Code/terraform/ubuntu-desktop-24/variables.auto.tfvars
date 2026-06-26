@@ -1,0 +1,1 @@
+ansible_ssh_public_key = "ssh-ed25519 AAAAC3NzaC1lZDI1NTE5AAAAID0902il5LiTB3W1SZ9ERhyHKOuoCMsI5Ct8yqnVyuWY ansible"

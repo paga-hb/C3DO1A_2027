@@ -1,0 +1,16 @@
+# FROM mcr.microsoft.com/dotnet/sdk:9.0
+# WORKDIR /src
+# EXPOSE 80
+# COPY ./*.sln ./
+# COPY ./Flixtube.MinioStorage/*.csproj ./Flixtube.MinioStorage/
+# RUN ["dotnet","restore"]
+# CMD ["dotnet","watch","run","--no-launch-profile","--project","Flixtube.MinioStorage"]
+
+FROM mcr.microsoft.com/dotnet/sdk:9.0
+WORKDIR .
+EXPOSE 80
+COPY ./*.sln ./
+COPY ./Flixtube.MinioStorage/ ./Flixtube.MinioStorage/
+#COPY ./Flixtube.MinioStorage/*.csproj ./Flixtube.MinioStorage/
+RUN ["dotnet","restore"]
+CMD ["dotnet","watch","run","--no-launch-profile","--project","Flixtube.MinioStorage"]

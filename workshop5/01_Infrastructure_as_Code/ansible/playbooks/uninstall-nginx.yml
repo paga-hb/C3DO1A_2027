@@ -1,0 +1,60 @@
+---
+- name: Uninstall and clean Nginx
+  hosts: gitea
+  become: true
+
+  vars:
+    remove_ssl_dir: true         # Remove /etc/nginx/ssl
+    ssl_dir: "/etc/nginx/ssl"
+    remove_nginx_config: true    # Remove /etc/nginx completely
+    remove_ufw_rules: false      # Remove firewall rules if used
+
+  tasks:
+
+    - name: Stop Nginx service if running
+      systemd:
+        name: nginx
+        state: stopped
+      ignore_errors: true
+
+    - name: Disable Nginx service
+      systemd:
+        name: nginx
+        enabled: false
+      ignore_errors: true
+
+    - name: Remove Nginx packages (purge)
+      apt:
+        name:
+          - nginx
+          - nginx-common
+          - nginx-core
+        state: absent
+        purge: yes
+        autoremove: yes
+
+    - name: Remove Nginx configuration directory
+      file:
+        path: /etc/nginx
+        state: absent
+      when: remove_nginx_config
+
+    - name: Remove SSL directory
+      file:
+        path: "{{ ssl_dir }}"
+        state: absent
+      when: remove_ssl_dir
+
+    # Optional: remove UFW rules if previously added
+    - name: Check if UFW exists
+      stat:
+        path: /usr/sbin/ufw
+      register: ufw_bin
+
+    - name: Remove HTTP/HTTPS rules from UFW
+      command: ufw delete allow "{{ item }}"
+      loop:
+        - "80/tcp"
+        - "443/tcp"
+      when: remove_ufw_rules and ufw_bin.stat.exists
+      ignore_errors: true

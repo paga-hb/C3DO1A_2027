@@ -1,0 +1,409 @@
+---
+- name: Install single-node Kubernetes on Ubuntu 24.04
+  hosts: k8s
+  become: true
+  gather_facts: true
+
+  vars:
+    k8s_minor_version: "v1.35"
+    calico_version: "v3.31.4"
+    pod_network_cidr: "192.168.0.0/16"
+    kubernetes_packages:
+      - kubelet
+      - kubeadm
+      - kubectl
+    kubeconfig_local_path: "{{ lookup('env','HOME') }}/.kube/config-{{ inventory_hostname }}"    
+    containerd_insecure_registries:
+      - "{{ gitea_site_url }}"
+
+  handlers:
+    - name: restart containerd
+      ansible.builtin.systemd:
+        name: containerd
+        state: restarted
+        daemon_reload: true
+
+  tasks:
+    - name: Update apt cache
+      ansible.builtin.apt:
+        update_cache: true
+        cache_valid_time: 3600
+
+    - name: Install base packages
+      ansible.builtin.apt:
+        name:
+          - apt-transport-https
+          - ca-certificates
+          - curl
+          - gpg
+          - containerd
+        state: present
+
+    - name: Disable swap immediately
+      ansible.builtin.command: swapoff -a
+      when: ansible_swaptotal_mb | int > 0
+      changed_when: ansible_swaptotal_mb | int > 0
+
+    - name: Disable swap in /etc/fstab
+      ansible.builtin.replace:
+        path: /etc/fstab
+        regexp: '^([^#].*\s+swap\s+.*)$'
+        replace: '# \1'
+
+    - name: Load overlay kernel module
+      ansible.builtin.command: modprobe overlay
+      changed_when: false
+
+    - name: Load br_netfilter kernel module
+      ansible.builtin.command: modprobe br_netfilter
+      changed_when: false
+
+    - name: Persist required kernel modules
+      ansible.builtin.copy:
+        dest: /etc/modules-load.d/k8s.conf
+        mode: "0644"
+        content: |
+          overlay
+          br_netfilter
+
+    - name: Set Kubernetes sysctl params
+      ansible.builtin.copy:
+        dest: /etc/sysctl.d/99-kubernetes-cri.conf
+        mode: "0644"
+        content: |
+          net.bridge.bridge-nf-call-iptables = 1
+          net.bridge.bridge-nf-call-ip6tables = 1
+          net.ipv4.ip_forward = 1
+
+    - name: Apply sysctl params
+      ansible.builtin.command: sysctl --system
+      changed_when: false
+
+    - name: Ensure /etc/containerd exists
+      ansible.builtin.file:
+        path: /etc/containerd
+        state: directory
+        mode: "0755"
+
+    - name: Generate default containerd config if missing
+      ansible.builtin.shell: |
+        set -o pipefail
+        containerd config default > /etc/containerd/config.toml
+      args:
+        executable: /bin/bash
+        creates: /etc/containerd/config.toml
+
+    - name: Configure containerd to use systemd cgroups
+      ansible.builtin.replace:
+        path: /etc/containerd/config.toml
+        regexp: 'SystemdCgroup = false'
+        replace: 'SystemdCgroup = true'
+      notify: restart containerd
+
+    - name: Enable and start containerd
+      ansible.builtin.systemd:
+        name: containerd
+        enabled: true
+        state: started
+
+    - name: Build registry hostport list
+      ansible.builtin.set_fact:
+        containerd_insecure_registry_hostports: >-
+          {{
+            containerd_insecure_registries
+            | map('regex_replace', '^https?://', '')
+            | list
+          }}
+
+    - name: Build registry.configs block
+      ansible.builtin.set_fact:
+        containerd_registry_configs_block: |-
+          {%- for registry in containerd_insecure_registry_hostports %}
+          [plugins."io.containerd.grpc.v1.cri".registry.configs."{{ registry }}".tls]
+            insecure_skip_verify = true
+          {% if not loop.last %}
+
+          {% endif -%}
+          {%- endfor %}
+
+    - name: Build registry.mirrors block
+      ansible.builtin.set_fact:
+        containerd_registry_mirrors_block: |-
+          {%- for registry in containerd_insecure_registry_hostports %}
+          [plugins."io.containerd.grpc.v1.cri".registry.mirrors."{{ registry }}"]
+            endpoint = ["http://{{ registry }}"]
+          {% if not loop.last %}
+
+          {% endif -%}
+          {%- endfor %}
+
+    - name: Replace contents of registry.configs section
+      ansible.builtin.replace:
+        path: /etc/containerd/config.toml
+        regexp: '(?ms)^(\s*\[plugins\."io\.containerd\.grpc\.v1\.cri"\.registry\.configs\]\s*\n)(.*?)(^\s*\[plugins\."io\.containerd\.grpc\.v1\.cri"\.registry\.headers\]\s*$)'
+        replace: "{{ '\\1' ~ (containerd_registry_configs_block | indent(8, true)) ~ '\n\\3' }}"
+
+    - name: Replace contents of registry.mirrors section
+      ansible.builtin.replace:
+        path: /etc/containerd/config.toml
+        regexp: '(?ms)^(\s*\[plugins\."io\.containerd\.grpc\.v1\.cri"\.registry\.mirrors\]\s*\n)(.*?)(^\s*\[plugins\."io\.containerd\.grpc\.v1\.cri"\.x509_key_pair_streaming\]\s*$)'
+        replace: "{{ '\\1' ~ (containerd_registry_mirrors_block | indent(8, true)) ~ '\n\\3' }}"
+
+    - name: Restart & enable containerd
+      ansible.builtin.systemd:
+        name: containerd
+        state: restarted
+        enabled: true
+
+    - name: Flush handlers before Kubernetes init
+      ansible.builtin.meta: flush_handlers
+
+    - name: Ensure /etc/apt/keyrings exists
+      ansible.builtin.file:
+        path: /etc/apt/keyrings
+        state: directory
+        mode: "0755"
+
+    - name: Download Kubernetes apt repo key
+      ansible.builtin.get_url:
+        url: "https://pkgs.k8s.io/core:/stable:/{{ k8s_minor_version }}/deb/Release.key"
+        dest: /tmp/kubernetes-apt-keyring.asc
+        mode: "0644"
+
+    - name: Dearmor Kubernetes apt repo key
+      ansible.builtin.command:
+        cmd: >-
+          gpg --dearmor
+          -o /etc/apt/keyrings/kubernetes-apt-keyring.gpg
+          /tmp/kubernetes-apt-keyring.asc
+      args:
+        creates: /etc/apt/keyrings/kubernetes-apt-keyring.gpg
+
+    - name: Add Kubernetes apt repository
+      ansible.builtin.copy:
+        dest: /etc/apt/sources.list.d/kubernetes.list
+        mode: "0644"
+        content: |
+          deb [signed-by=/etc/apt/keyrings/kubernetes-apt-keyring.gpg] https://pkgs.k8s.io/core:/stable:/{{ k8s_minor_version }}/deb/ /
+
+    - name: Update apt cache after adding Kubernetes repo
+      ansible.builtin.apt:
+        update_cache: true
+
+    - name: Install Kubernetes packages
+      ansible.builtin.apt:
+        name: "{{ kubernetes_packages }}"
+        state: present
+
+    - name: Hold Kubernetes packages
+      ansible.builtin.dpkg_selections:
+        name: "{{ item }}"
+        selection: hold
+      loop: "{{ kubernetes_packages }}"
+
+    - name: Enable kubelet
+      ansible.builtin.systemd:
+        name: kubelet
+        enabled: true
+        state: started
+
+    - name: Check whether cluster is already initialized
+      ansible.builtin.stat:
+        path: /etc/kubernetes/admin.conf
+      register: kubeadmin_conf
+
+    - name: Initialize Kubernetes control plane
+      ansible.builtin.command: >-
+        kubeadm init
+        --pod-network-cidr={{ pod_network_cidr }}
+      when: not kubeadmin_conf.stat.exists
+
+    - name: Create root kube config dir
+      ansible.builtin.file:
+        path: /root/.kube
+        state: directory
+        mode: "0700"
+
+    - name: Copy admin kubeconfig to root
+      ansible.builtin.copy:
+        src: /etc/kubernetes/admin.conf
+        dest: /root/.kube/config
+        remote_src: true
+        owner: root
+        group: root
+        mode: "0600"
+
+    - name: Wait for API server to respond
+      ansible.builtin.command: kubectl get nodes
+      environment:
+        KUBECONFIG: /etc/kubernetes/admin.conf
+      register: apiserver_ready
+      changed_when: false
+      retries: 30
+      delay: 10
+      until: apiserver_ready.rc == 0
+
+    - name: Remove control-plane taint for single-node scheduling
+      ansible.builtin.command: kubectl taint nodes --all node-role.kubernetes.io/control-plane-
+      environment:
+        KUBECONFIG: /etc/kubernetes/admin.conf
+      register: taint_remove
+      failed_when: false
+      changed_when: >
+        'untainted' in taint_remove.stdout or
+        'untainted' in taint_remove.stderr
+
+    - name: Install Calico operator CRDs with create workaround
+      ansible.builtin.command: >-
+        kubectl create -f
+        https://raw.githubusercontent.com/projectcalico/calico/{{ calico_version }}/manifests/operator-crds.yaml
+      environment:
+        KUBECONFIG: /etc/kubernetes/admin.conf
+      register: calico_crds
+      failed_when: >
+        calico_crds.rc != 0 and
+        'AlreadyExists' not in calico_crds.stderr
+      changed_when: >
+        'created' in calico_crds.stdout
+
+    - name: Wait for Installation CRD
+      ansible.builtin.command: kubectl get crd installations.operator.tigera.io
+      environment:
+        KUBECONFIG: /etc/kubernetes/admin.conf
+      register: installation_crd
+      changed_when: false
+      retries: 30
+      delay: 5
+      until: installation_crd.rc == 0
+
+    - name: Wait for APIServer CRD
+      ansible.builtin.command: kubectl get crd apiservers.operator.tigera.io
+      environment:
+        KUBECONFIG: /etc/kubernetes/admin.conf
+      register: apiserver_crd
+      changed_when: false
+      retries: 30
+      delay: 5
+      until: apiserver_crd.rc == 0
+
+    - name: Install Tigera operator
+      ansible.builtin.command: >-
+        kubectl apply -f
+        https://raw.githubusercontent.com/projectcalico/calico/{{ calico_version }}/manifests/tigera-operator.yaml
+      environment:
+        KUBECONFIG: /etc/kubernetes/admin.conf
+      register: tigera_apply
+      changed_when: >
+        'created' in tigera_apply.stdout or
+        'configured' in tigera_apply.stdout
+
+    - name: Write Calico custom resources
+      ansible.builtin.copy:
+        dest: /root/calico-custom-resources.yaml
+        mode: "0644"
+        content: |
+          apiVersion: operator.tigera.io/v1
+          kind: Installation
+          metadata:
+            name: default
+          spec:
+            calicoNetwork:
+              ipPools:
+                - name: default-ipv4-ippool
+                  blockSize: 26
+                  cidr: {{ pod_network_cidr }}
+                  encapsulation: VXLANCrossSubnet
+                  natOutgoing: Enabled
+                  nodeSelector: all()
+          ---
+          apiVersion: operator.tigera.io/v1
+          kind: APIServer
+          metadata:
+            name: default
+          spec: {}
+
+    - name: Install Calico custom resources
+      ansible.builtin.command: kubectl apply -f /root/calico-custom-resources.yaml
+      environment:
+        KUBECONFIG: /etc/kubernetes/admin.conf
+
+    - name: Wait for tigerastatus objects
+      ansible.builtin.command: kubectl get tigerastatus
+      environment:
+        KUBECONFIG: /etc/kubernetes/admin.conf
+      register: tigera_status
+      changed_when: false
+      retries: 30
+      delay: 10
+      until: tigera_status.rc == 0
+
+    - name: Wait for node to become Ready
+      ansible.builtin.command: kubectl get nodes --no-headers
+      environment:
+        KUBECONFIG: /etc/kubernetes/admin.conf
+      register: node_status
+      changed_when: false
+      retries: 30
+      delay: 20
+      until: "' Ready ' in node_status.stdout"
+
+    - name: Ensure local kube config directory exists
+      ansible.builtin.file:
+        path: "{{ lookup('env','HOME') }}/.kube"
+        state: directory
+        mode: "0700"
+      delegate_to: localhost
+      become: false
+
+    - name: Fetch kubeconfig from node to local machine
+      ansible.builtin.fetch:
+        src: /etc/kubernetes/admin.conf
+        dest: "{{ kubeconfig_local_path }}"
+        flat: true
+
+    - name: Fix server address in kubeconfig
+      ansible.builtin.replace:
+        path: "{{ kubeconfig_local_path }}"
+        regexp: 'server: https://127.0.0.1:6443'
+        replace: "server: https://{{ ansible_host | default(inventory_hostname) }}:6443"
+      delegate_to: localhost
+      become: false
+
+    - name: Ensure local kubeconfig permissions
+      ansible.builtin.file:
+        path: "{{ kubeconfig_local_path }}"
+        mode: "0600"
+      delegate_to: localhost
+      become: false
+      run_once: true
+
+    - name: Show how to use kubeconfig locally
+      ansible.builtin.debug:
+        msg: >
+          Use your cluster from this machine with:
+          'export KUBECONFIG={{ kubeconfig_local_path }}' then 'kubectl get nodes'.
+      delegate_to: localhost
+      become: false
+      run_once: true
+
+    # - name: Show pods
+    #   ansible.builtin.command: kubectl get pods -A -o wide
+    #   environment:
+    #     KUBECONFIG: /etc/kubernetes/admin.conf
+    #   register: final_pods
+    #   changed_when: false
+
+    # - name: Show nodes
+    #   ansible.builtin.command: kubectl get nodes -o wide
+    #   environment:
+    #     KUBECONFIG: /etc/kubernetes/admin.conf
+    #   register: final_nodes
+    #   changed_when: false
+
+    # - name: Print node status
+    #   ansible.builtin.debug:
+    #     var: final_nodes.stdout_lines
+
+    # - name: Print pod status
+    #   ansible.builtin.debug:
+    #     var: final_pods.stdout_lines

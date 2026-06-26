@@ -1,0 +1,66 @@
+#cloud-config
+package_update: true
+package_upgrade: true
+
+packages:
+  - locales
+  - console-setup
+  - keyboard-configuration
+  - language-pack-en
+  - language-pack-sv
+  - qemu-guest-agent
+  - openssh-server
+
+timezone: Europe/Stockholm
+locale: en_US.UTF-8
+
+keyboard:
+  layout: se
+  model: pc105
+  variant: ""
+  options: ""
+
+users:
+  - name: ${ansible_username}
+    gecos: ${ansible_realname}
+    groups: [adm, sudo]
+    lock-passwd: true
+    shell: /bin/bash
+    sudo: ["ALL=(ALL) NOPASSWD:ALL"]
+    ssh_authorized_keys:
+      - ${ansible_ssh_public_key}
+
+write_files:
+  - path: /var/lib/AccountsService/users/${ansible_username}
+    owner: root:root
+    permissions: '0644'
+    content: |
+      [User]
+      SystemAccount=true
+
+ssh_pwauth: true
+disable_root: true
+
+hostname: ${hostname}
+fqdn: ${fqdn}
+manage_etc_hosts: true
+
+runcmd:
+  - sed -i 's/^# *sv_SE.UTF-8 UTF-8/sv_SE.UTF-8 UTF-8/' /etc/locale.gen
+  - sed -i 's/^# *en_US.UTF-8 UTF-8/en_US.UTF-8 UTF-8/' /etc/locale.gen
+  - locale-gen
+  - update-locale
+      LANG=en_US.UTF-8
+      LANGUAGE="en_US:en"
+      LC_MESSAGES=en_US.UTF-8
+      LC_TIME=sv_SE.UTF-8
+      LC_NUMERIC=sv_SE.UTF-8
+      LC_MONETARY=sv_SE.UTF-8
+      LC_MEASUREMENT=sv_SE.UTF-8
+      LC_PAPER=sv_SE.UTF-8
+      LC_NAME=sv_SE.UTF-8
+      LC_ADDRESS=sv_SE.UTF-8
+      LC_TELEPHONE=sv_SE.UTF-8
+  - sed -i 's/^XKBLAYOUT=.*/XKBLAYOUT="se"/' /etc/default/keyboard || true
+  - sed -i 's/^XKBMODEL=.*/XKBMODEL="pc105"/' /etc/default/keyboard || true
+  - systemctl enable --now ssh
