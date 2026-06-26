@@ -1,4 +1,4 @@
-# DevOps (C3DO1A) Spring 2026
+# DevOps (C3DO1A) Spring 2027
 
 This is the repository for the DevOps (Spring 2027) course at Borås University.
 
