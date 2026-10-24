@@ -2,7 +2,7 @@
 
 This is the repository for the DevOps (Spring 2027) course at Borås University.
 
-The course schedule can be found on [Kronox](https://schema.hb.se/setup/jsp/Schema.jsp?startDatum=2026-03-30&intervallTyp=a&intervallAntal=1&sprak=EN&sokMedAND=true&forklaringar=true&resurser=k.C3DO1A-20261-I16V6-) and the course material can be found on [Canvas](https://hb.instructure.com/courses/11155).
+The course schedule can be found on [Kronox](https://schema.hb.se/setup/jsp/Schema.jsp?sprak=EN&forklaringar=true&sokMedAND=true&intervallAntal=1&startDatum=2027-03-22&intervallTyp=a&resurser=k.C1DOIA-20271-IN54V-) and the course material can be found on [Canvas](https://hb.instructure.com/courses/12968).
 
 **Note:** If you are using one of the university's virtual machines, you can skip ahead to [Accounts](#accounts).
 
@@ -56,7 +56,7 @@ Create a GitHub, Docker and Azure for Students account (if you don't already hav
 
 ## Course Repository
 
-When you have installed the software above, open a **terminal** and clone the GitHub repository [C3DO1A_2026](https://github.com/paga-hb/C3DO1A_2026) to your computer, and create a Python environment.
+When you have installed the software above, open a **terminal** and clone the GitHub repository [C3DO1A_2026](https://github.com/paga-hb/C3DO1A_2027) to your computer, and create a Python environment.
 
 **Note:** If you are on one of the universitiy's virtual machines, you can open a **terminal** via the main menu: `Applications` $\rightarrow$ `Terminal Emulator`
 
