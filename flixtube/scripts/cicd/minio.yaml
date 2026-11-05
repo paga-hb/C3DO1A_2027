@@ -21,7 +21,8 @@ spec:
     spec:
       containers:
       - name: minio
-        image: minio/minio:RELEASE.2024-12-18T13-15-44Z
+        # image: minio/minio:RELEASE.2024-12-18T13-15-44Z
+        image: coollabsio/minio:RELEASE.2025-04-22T22-12-26Z
         imagePullPolicy: Always
         command: ["minio", "server", "/data", "--address", "0.0.0.0:9000", "--console-address", ":9001"]
         resources:
@@ -82,7 +83,8 @@ spec:
     spec: 
       containers: 
       - name: minio-mc 
-        image: minio/mc:RELEASE.2024-11-21T17-21-54Z
+        # image: minio/mc:RELEASE.2024-11-21T17-21-54Z
+        image: clickhouse/minio-mc:RELEASE.2025-04-16T18-13-26Z
         command:
             - /bin/sh
             - -c
